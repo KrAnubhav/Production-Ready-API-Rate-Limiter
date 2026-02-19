@@ -14,6 +14,11 @@ public class RateLimiterProperties {
     private int defaultLimit = 100;
     private int defaultWindowSeconds = 60;
     private int defaultRefillRate = 10;
+    /**
+     * When true, Redis-backed strategies are used (Docker/production). False =
+     * in-memory (local profile).
+     */
+    private boolean useRedis = false;
 
     public String getAlgorithm() {
         return algorithm;
@@ -45,5 +50,13 @@ public class RateLimiterProperties {
 
     public void setDefaultRefillRate(int defaultRefillRate) {
         this.defaultRefillRate = defaultRefillRate;
+    }
+
+    public boolean isUseRedis() {
+        return useRedis;
+    }
+
+    public void setUseRedis(boolean useRedis) {
+        this.useRedis = useRedis;
     }
 }

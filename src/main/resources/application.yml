@@ -38,6 +38,8 @@ rate-limiter:
   default-limit: 100
   default-window-seconds: 60
   default-refill-rate: 10   # tokens per second (Token Bucket only)
+  # Phase 2: use Redis for distributed rate limiting (false = in-memory, local dev)
+  use-redis: true
 
 # Swagger / OpenAPI
 springdoc:

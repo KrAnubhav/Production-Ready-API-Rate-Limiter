@@ -4,7 +4,7 @@
 > **Goal:** Replace in-memory HashMap with Redis for distributed, multi-instance rate limiting  
 > **Phase 2 Choice:** Option B — Distributed Rate Limiting with Redis  
 > **Points at stake:** 15 pts  
-> **Status:** 🔲 TODO
+> **Status:** ✅ COMPLETE — All 34 tests passing, pushed to main
 
 ---
 

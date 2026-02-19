@@ -40,6 +40,13 @@ rate-limiter:
   default-refill-rate: 10   # tokens per second (Token Bucket only)
   # Phase 2: use Redis for distributed rate limiting (false = in-memory, local dev)
   use-redis: true
+  # Phase 3: Circuit Breaker
+  circuit-breaker:
+    enabled: true
+    failure-threshold: 5         # consecutive Redis failures to trip OPEN
+    window-seconds: 60           # monitoring window (metadata)
+    half-open-timeout-seconds: 30  # seconds in OPEN before probing
+    fail-open: true              # true=allow traffic when OPEN, false=block all
 
 # Swagger / OpenAPI
 springdoc:
@@ -49,15 +56,19 @@ springdoc:
     path: /swagger-ui.html
     enabled: true
 
-# Actuator
+# Actuator — expose health, prometheus, metrics endpoints
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
   endpoint:
     health:
       show-details: always
+  metrics:
+    export:
+      prometheus:
+        enabled: true
 
 server:
   port: 8080

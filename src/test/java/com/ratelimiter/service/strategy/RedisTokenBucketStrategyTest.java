@@ -1,5 +1,7 @@
 package com.ratelimiter.service.strategy;
 
+import com.ratelimiter.circuitbreaker.CircuitBreaker;
+import com.ratelimiter.circuitbreaker.CircuitBreakerProperties;
 import com.ratelimiter.model.RateLimitConfig;
 import com.ratelimiter.model.RateLimitEntry;
 import org.junit.jupiter.api.BeforeEach;
@@ -12,12 +14,13 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Unit tests for RedisTokenBucketStrategy.
+ * Unit tests for RedisTokenBucketStrategy (Phase 2 + Phase 3 Circuit Breaker).
  *
  * Java 25 + Mockito 5 cannot mock Spring framework classes (DefaultRedisScript,
  * RedisTemplate) via byte-buddy. We work around this with:
  * - StubRedisTemplate: extends RedisTemplate and overrides execute()/delete()
  * - FakeFallback: implements RateLimiterStrategy interface directly
+ * - StubCircuitBreaker: always-CLOSED pass-through (tests the happy path)
  *
  * This avoids all Mockito/byte-buddy restrictions while giving full test
  * coverage.
@@ -92,15 +95,17 @@ class RedisTokenBucketStrategyTest {
 
     // ── Testable subclass ──────────────────────────────────────────────────────
     // We subclass RedisTokenBucketStrategy to inject our FakeFallback.
-    // The parent constructor needs a TokenBucketStrategy; we pass null and
-    // override every method that would call it.
+    // Parent constructor now requires 4 args: template, script, fallback,
+    // circuitBreaker.
+    // We pass a real (always-CLOSED) circuit breaker so circuit-breaker path is
+    // traversed.
 
     class TestableRedisTokenBucket extends RedisTokenBucketStrategy {
         private final StubRedisTemplate tpl;
         private final FakeFallback fb;
 
-        TestableRedisTokenBucket(StubRedisTemplate tpl, FakeFallback fb) {
-            super(tpl, null, null); // nulls are fine — we override everything
+        TestableRedisTokenBucket(StubRedisTemplate tpl, FakeFallback fb, CircuitBreaker cb) {
+            super(tpl, null, null, cb); // nulls: script + fallback overridden below
             this.tpl = tpl;
             this.fb = fb;
         }
@@ -140,12 +145,18 @@ class RedisTokenBucketStrategyTest {
     private FakeFallback fallback;
     private TestableRedisTokenBucket strategy;
     private RateLimitConfig config;
+    private CircuitBreaker circuitBreaker;
 
     @BeforeEach
     void setUp() {
         tpl = new StubRedisTemplate();
         fallback = new FakeFallback();
-        strategy = new TestableRedisTokenBucket(tpl, fallback);
+        // Always-CLOSED circuit breaker — doesn't interfere with Redis calls in these
+        // tests
+        CircuitBreakerProperties props = new CircuitBreakerProperties();
+        props.setEnabled(false); // disabled → allowRequest() always returns true
+        circuitBreaker = new CircuitBreaker(props);
+        strategy = new TestableRedisTokenBucket(tpl, fallback, circuitBreaker);
         config = RateLimitConfig.builder()
                 .identifier("user-1")
                 .identifierType(RateLimitConfig.IdentifierType.USER_ID)

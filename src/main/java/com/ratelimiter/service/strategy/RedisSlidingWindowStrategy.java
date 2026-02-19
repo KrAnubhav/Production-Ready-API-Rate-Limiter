@@ -1,20 +1,27 @@
 package com.ratelimiter.service.strategy;
 
+import com.ratelimiter.circuitbreaker.CircuitBreaker;
 import com.ratelimiter.model.RateLimitConfig;
 import com.ratelimiter.model.RateLimitEntry;
+import com.ratelimiter.metrics.RateLimiterMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.RedisConnectionFailureException;
 import org.springframework.data.redis.core.RedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Component;
 
 import java.util.List;
+import java.util.Set;
 
 /**
- * Redis-backed Sliding Window Rate Limiting Strategy — Phase 2.
+ * Redis-backed Sliding Window Rate Limiting Strategy — Phase 2 + Phase 3.
+ *
+ * Phase 3 addition: Circuit Breaker wraps every Redis call.
  *
  * Uses a Redis Sorted Set where:
  * member = "{timestamp}-{random}" (unique per request)
@@ -25,11 +32,6 @@ import java.util.List;
  * in one Redis call, preventing race conditions.
  *
  * Redis Key: rate_limit:window:{identifier}
- * Redis Type: Sorted Set
- * TTL: windowSeconds (auto-expires idle keys)
- *
- * Fallback: On RedisConnectionFailureException, delegates to the
- * in-memory SlidingWindowStrategy transparently.
  */
 @Component("redisSlidingWindowStrategy")
 @ConditionalOnProperty(name = "rate-limiter.use-redis", havingValue = "true")
@@ -40,19 +42,35 @@ public class RedisSlidingWindowStrategy implements RateLimiterStrategy {
 
     private final RedisTemplate<String, String> redisTemplate;
     private final DefaultRedisScript<List<Long>> slidingWindowScript;
-    private final SlidingWindowStrategy fallback; // in-memory fallback
+    private final SlidingWindowStrategy fallback;
+    private final CircuitBreaker circuitBreaker;
+
+    @Autowired(required = false)
+    private RateLimiterMetrics metrics;
 
     public RedisSlidingWindowStrategy(
             RedisTemplate<String, String> redisTemplate,
             @Qualifier("slidingWindowScript") DefaultRedisScript<List<Long>> slidingWindowScript,
-            @Qualifier("slidingWindowStrategy") SlidingWindowStrategy fallback) {
+            @Qualifier("slidingWindowStrategy") SlidingWindowStrategy fallback,
+            CircuitBreaker circuitBreaker) {
         this.redisTemplate = redisTemplate;
         this.slidingWindowScript = slidingWindowScript;
         this.fallback = fallback;
+        this.circuitBreaker = circuitBreaker;
     }
 
     @Override
     public boolean isAllowed(String identifier, RateLimitConfig config) {
+        // ── Circuit Breaker check ─────────────────────────────────────────────
+        if (!circuitBreaker.allowRequest()) {
+            log.warn("[CircuitBreaker] OPEN — {} mode for: {}",
+                    circuitBreaker.isFailOpen() ? "fail-open (allowing)" : "fail-closed (fallback)",
+                    identifier);
+            recordFallback();
+            return fallback.isAllowed(identifier, config);
+        }
+
+        // ── Redis call ────────────────────────────────────────────────────────
         try {
             String key = KEY_PREFIX + identifier;
             long now = System.currentTimeMillis();
@@ -67,61 +85,76 @@ public class RedisSlidingWindowStrategy implements RateLimiterStrategy {
                     String.valueOf(config.getWindowSeconds()));
 
             if (result == null || result.isEmpty()) {
-                log.warn("[Redis] Null result from Lua sliding window for {}. Using fallback.", identifier);
+                log.warn("[Redis] Null Lua sliding window result for {}. Fallback.", identifier);
+                circuitBreaker.recordFailure();
+                recordFallback();
                 return fallback.isAllowed(identifier, config);
             }
 
+            circuitBreaker.recordSuccess();
             boolean allowed = result.get(0) == 1L;
-            log.debug("[Redis] Sliding Window: identifier={} allowed={} remaining={}", identifier, allowed,
-                    result.get(1));
+            log.debug("[Redis] Sliding Window: identifier={} allowed={} remaining={}",
+                    identifier, allowed, result.get(1));
             return allowed;
 
         } catch (RedisConnectionFailureException ex) {
-            log.warn("[Redis] Connection failed — falling back to in-memory for identifier: {}", identifier);
+            log.warn("[Redis] Connection failed — recording failure + fallback for: {}", identifier);
+            circuitBreaker.recordFailure();
+            recordFallback();
             return fallback.isAllowed(identifier, config);
         }
     }
 
     @Override
     public RateLimitEntry getEntry(String identifier) {
-        return null; // Not applicable for Redis-backed strategy
+        return null;
     }
 
     @Override
     public void reset(String identifier, RateLimitConfig config) {
+        if (!circuitBreaker.allowRequest()) {
+            fallback.reset(identifier, config);
+            return;
+        }
         try {
-            String key = KEY_PREFIX + identifier;
-            redisTemplate.delete(key);
-            log.info("[Redis] Sliding Window reset for identifier: {}", identifier);
+            redisTemplate.delete(KEY_PREFIX + identifier);
+            circuitBreaker.recordSuccess();
+            log.info("[Redis] Sliding Window reset for: {}", identifier);
         } catch (RedisConnectionFailureException ex) {
-            log.warn("[Redis] Connection failed during reset — using fallback for: {}", identifier);
+            log.warn("[Redis] Reset connection failed — fallback for: {}", identifier);
+            circuitBreaker.recordFailure();
             fallback.reset(identifier, config);
         }
     }
 
     @Override
     public long getRemainingRequests(String identifier, RateLimitConfig config) {
+        if (!circuitBreaker.allowRequest()) {
+            return fallback.getRemainingRequests(identifier, config);
+        }
         try {
             String key = KEY_PREFIX + identifier;
             long now = System.currentTimeMillis();
             long windowStart = now - config.getWindowSeconds() * 1000L;
             Long count = redisTemplate.opsForZSet().count(key, windowStart, now);
+            circuitBreaker.recordSuccess();
             if (count == null)
                 return config.getMaxRequests();
             return Math.max(0, config.getMaxRequests() - count);
         } catch (RedisConnectionFailureException ex) {
-            log.warn("[Redis] Connection failed — using fallback getRemainingRequests for: {}", identifier);
+            circuitBreaker.recordFailure();
             return fallback.getRemainingRequests(identifier, config);
         }
     }
 
     @Override
     public long getResetTimeEpochSeconds(String identifier, RateLimitConfig config) {
+        if (!circuitBreaker.allowRequest()) {
+            return System.currentTimeMillis() / 1000 + config.getWindowSeconds();
+        }
         try {
             String key = KEY_PREFIX + identifier;
-            // Oldest score in the set = when the earliest request in window expires
-            java.util.Set<org.springframework.data.redis.core.ZSetOperations.TypedTuple<String>> oldest = redisTemplate
-                    .opsForZSet().rangeWithScores(key, 0, 0);
+            Set<ZSetOperations.TypedTuple<String>> oldest = redisTemplate.opsForZSet().rangeWithScores(key, 0, 0);
             if (oldest == null || oldest.isEmpty()) {
                 return System.currentTimeMillis() / 1000 + config.getWindowSeconds();
             }
@@ -135,5 +168,10 @@ public class RedisSlidingWindowStrategy implements RateLimiterStrategy {
     @Override
     public String getAlgorithmName() {
         return "REDIS_SLIDING_WINDOW";
+    }
+
+    private void recordFallback() {
+        if (metrics != null)
+            metrics.recordFallback();
     }
 }

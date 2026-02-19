@@ -1,5 +1,7 @@
 package com.ratelimiter.service.strategy;
 
+import com.ratelimiter.circuitbreaker.CircuitBreaker;
+import com.ratelimiter.circuitbreaker.CircuitBreakerProperties;
 import com.ratelimiter.model.RateLimitConfig;
 import com.ratelimiter.model.RateLimitEntry;
 import org.junit.jupiter.api.BeforeEach;
@@ -12,7 +14,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * Unit tests for RedisSlidingWindowStrategy.
+ * Unit tests for RedisSlidingWindowStrategy (Phase 2 + Phase 3 Circuit
+ * Breaker).
  *
  * Uses the same stub pattern as RedisTokenBucketStrategyTest to avoid
  * Mockito / Java 25 byte-buddy incompatibility with Spring framework classes.
@@ -86,13 +89,15 @@ class RedisSlidingWindowStrategyTest {
     }
 
     // ── Testable subclass ──────────────────────────────────────────────────────
+    // Parent constructor now requires 4 args: template, script, fallback,
+    // circuitBreaker.
 
     class TestableRedisSlidingWindow extends RedisSlidingWindowStrategy {
         private final StubRedisTemplate tpl;
         private final FakeFallback fb;
 
-        TestableRedisSlidingWindow(StubRedisTemplate tpl, FakeFallback fb) {
-            super(tpl, null, null);
+        TestableRedisSlidingWindow(StubRedisTemplate tpl, FakeFallback fb, CircuitBreaker cb) {
+            super(tpl, null, null, cb);
             this.tpl = tpl;
             this.fb = fb;
         }
@@ -137,7 +142,11 @@ class RedisSlidingWindowStrategyTest {
     void setUp() {
         tpl = new StubRedisTemplate();
         fallback = new FakeFallback();
-        strategy = new TestableRedisSlidingWindow(tpl, fallback);
+        // Disabled circuit breaker — doesn't interfere with Redis call tests
+        CircuitBreakerProperties props = new CircuitBreakerProperties();
+        props.setEnabled(false);
+        CircuitBreaker circuitBreaker = new CircuitBreaker(props);
+        strategy = new TestableRedisSlidingWindow(tpl, fallback, circuitBreaker);
         config = RateLimitConfig.builder()
                 .identifier("user-2")
                 .identifierType(RateLimitConfig.IdentifierType.USER_ID)

@@ -26,6 +26,12 @@ rate-limiter:
   default-refill-rate: 2
   # Local dev: disable Redis, use in-memory strategies
   use-redis: false
+  # Phase 3: Circuit Breaker — lower threshold for local demo/testing
+  circuit-breaker:
+    enabled: true
+    failure-threshold: 3         # trip faster for local testing
+    half-open-timeout-seconds: 10  # recover faster for local testing
+    fail-open: true
 
 springdoc:
   api-docs:
@@ -38,7 +44,7 @@ management:
   endpoints:
     web:
       exposure:
-        include: health,info
+        include: health,info,prometheus
 
 server:
   port: 8080

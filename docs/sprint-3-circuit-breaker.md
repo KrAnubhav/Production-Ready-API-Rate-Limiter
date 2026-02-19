@@ -4,7 +4,7 @@
 > **Goal:** Add Circuit Breaker pattern for resiliency + complete all submission requirements  
 > **Phase 3 Choice:** Option B — Resiliency & Circuit Breaker  
 > **Points at stake:** 10 pts (Phase 3) + final submission  
-> **Status:** 🔲 TODO
+> **Status:** ✅ COMPLETE
 
 ---
 
@@ -18,10 +18,10 @@ Wrap the Redis rate limiter with a **Circuit Breaker** that detects when Redis i
 
 | # | Story | Acceptance Criteria | Status |
 |---|-------|---------------------|--------|
-| US-13 | As an ops engineer, I want rate limiter to stay up even when Redis fails | Circuit opens, app fails gracefully (open or closed) | 🔲 Todo |
-| US-14 | As an ops engineer, I want to configure fail-open vs fail-closed | `rate-limiter.circuit-breaker.fail-open=true` works | 🔲 Todo |
-| US-15 | As an ops engineer, I want escalating block durations for bad actors | 5min → 15min → 1hr auto-escalation | 🔲 Todo |
-| US-16 | As a developer, I want circuit breaker state in the health endpoint | `/actuator/health` shows circuit state | 🔲 Todo |
+| US-13 | As an ops engineer, I want rate limiter to stay up even when Redis fails | Circuit opens, app fails gracefully (open or closed) | ✅ Done |
+| US-14 | As an ops engineer, I want to configure fail-open vs fail-closed | `rate-limiter.circuit-breaker.fail-open=true` works | ✅ Done |
+| US-15 | As an ops engineer, I want escalating block durations for bad actors | base × 1 → base × 3 → base × 12 auto-escalation | ✅ Done |
+| US-16 | As a developer, I want circuit breaker state in the health endpoint | `/actuator/health` shows circuit state | ✅ Done |
 | US-17 | As an evaluator, I want a 2-min demo video showing all features | Screen recording uploaded | 🔲 Todo |
 
 ---

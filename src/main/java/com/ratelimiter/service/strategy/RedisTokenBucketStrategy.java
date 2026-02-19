@@ -1,9 +1,12 @@
 package com.ratelimiter.service.strategy;
 
+import com.ratelimiter.circuitbreaker.CircuitBreaker;
 import com.ratelimiter.model.RateLimitConfig;
 import com.ratelimiter.model.RateLimitEntry;
+import com.ratelimiter.metrics.RateLimiterMetrics;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 import org.springframework.data.redis.RedisConnectionFailureException;
@@ -14,19 +17,21 @@ import org.springframework.stereotype.Component;
 import java.util.List;
 
 /**
- * Redis-backed Token Bucket Rate Limiting Strategy — Phase 2.
+ * Redis-backed Token Bucket Rate Limiting Strategy — Phase 2 + Phase 3.
  *
- * Uses an atomic Lua script (scripts/token_bucket.lua) to perform:
- * HMGET → refill calculation → HMSET → EXPIRE
- * in a single Redis round-trip, preventing race conditions across
- * multiple application instances.
+ * Phase 3 addition: Circuit Breaker wraps every Redis call.
+ *
+ * Decision flow:
+ * 1. circuitBreaker.allowRequest()?
+ * NO + fail-open → allow through (fallback)
+ * NO + fail-closed → delegate to in-memory fallback
+ * YES → proceed to Redis Lua script
+ * 2. Redis call succeeds → circuitBreaker.recordSuccess()
+ * 3. Redis call fails → circuitBreaker.recordFailure() → may trip circuit OPEN
  *
  * Redis Key: rate_limit:token:{identifier}
  * Redis Type: Hash { tokens, last_refill, capacity }
  * TTL: windowSeconds (auto-expires unused keys)
- *
- * Fallback: On RedisConnectionFailureException, delegates to the
- * in-memory TokenBucketStrategy transparently.
  */
 @Component("redisTokenBucketStrategy")
 @ConditionalOnProperty(name = "rate-limiter.use-redis", havingValue = "true")
@@ -37,19 +42,37 @@ public class RedisTokenBucketStrategy implements RateLimiterStrategy {
 
     private final RedisTemplate<String, String> redisTemplate;
     private final DefaultRedisScript<List<Long>> tokenBucketScript;
-    private final TokenBucketStrategy fallback; // in-memory fallback
+    private final TokenBucketStrategy fallback;
+    private final CircuitBreaker circuitBreaker;
+
+    // Optional — only wired when metrics bean is available (use-redis=true
+    // activates it)
+    @Autowired(required = false)
+    private RateLimiterMetrics metrics;
 
     public RedisTokenBucketStrategy(
             RedisTemplate<String, String> redisTemplate,
             @Qualifier("tokenBucketScript") DefaultRedisScript<List<Long>> tokenBucketScript,
-            @Qualifier("tokenBucketStrategy") TokenBucketStrategy fallback) {
+            @Qualifier("tokenBucketStrategy") TokenBucketStrategy fallback,
+            CircuitBreaker circuitBreaker) {
         this.redisTemplate = redisTemplate;
         this.tokenBucketScript = tokenBucketScript;
         this.fallback = fallback;
+        this.circuitBreaker = circuitBreaker;
     }
 
     @Override
     public boolean isAllowed(String identifier, RateLimitConfig config) {
+        // ── Circuit Breaker check ─────────────────────────────────────────────
+        if (!circuitBreaker.allowRequest()) {
+            log.warn("[CircuitBreaker] OPEN — {} mode for: {}",
+                    circuitBreaker.isFailOpen() ? "fail-open (allowing)" : "fail-closed (fallback)",
+                    identifier);
+            recordFallback();
+            return fallback.isAllowed(identifier, config);
+        }
+
+        // ── Redis call ────────────────────────────────────────────────────────
         try {
             String key = KEY_PREFIX + identifier;
             long now = System.currentTimeMillis();
@@ -63,63 +86,78 @@ public class RedisTokenBucketStrategy implements RateLimiterStrategy {
                     String.valueOf(config.getWindowSeconds()));
 
             if (result == null || result.isEmpty()) {
-                log.warn("[Redis] Null result from Lua script for {}. Using fallback.", identifier);
+                log.warn("[Redis] Null script result for {}. Using fallback.", identifier);
+                circuitBreaker.recordFailure();
+                recordFallback();
                 return fallback.isAllowed(identifier, config);
             }
 
+            circuitBreaker.recordSuccess();
             boolean allowed = result.get(0) == 1L;
-            log.debug("[Redis] Token Bucket: identifier={} allowed={} remaining={}", identifier, allowed,
-                    result.get(1));
+            log.debug("[Redis] Token Bucket: identifier={} allowed={} remaining={}",
+                    identifier, allowed, result.get(1));
             return allowed;
 
         } catch (RedisConnectionFailureException ex) {
-            log.warn("[Redis] Connection failed — falling back to in-memory for identifier: {}", identifier);
+            log.warn("[Redis] Connection failed — recording failure + fallback for: {}", identifier);
+            circuitBreaker.recordFailure();
+            recordFallback();
             return fallback.isAllowed(identifier, config);
         }
     }
 
     @Override
     public RateLimitEntry getEntry(String identifier) {
-        // Redis state is not mapped to RateLimitEntry — return null (not used in
-        // filter)
-        return null;
+        return null; // Redis state not mapped to RateLimitEntry
     }
 
     @Override
     public void reset(String identifier, RateLimitConfig config) {
+        if (!circuitBreaker.allowRequest()) {
+            fallback.reset(identifier, config);
+            return;
+        }
         try {
-            String key = KEY_PREFIX + identifier;
-            // Delete the key — next request will start with a full bucket
-            redisTemplate.delete(key);
-            log.info("[Redis] Token Bucket reset for identifier: {}", identifier);
+            redisTemplate.delete(KEY_PREFIX + identifier);
+            circuitBreaker.recordSuccess();
+            log.info("[Redis] Token Bucket reset for: {}", identifier);
         } catch (RedisConnectionFailureException ex) {
-            log.warn("[Redis] Connection failed during reset — using fallback for: {}", identifier);
+            log.warn("[Redis] Reset connection failed — fallback for: {}", identifier);
+            circuitBreaker.recordFailure();
             fallback.reset(identifier, config);
         }
     }
 
     @Override
     public long getRemainingRequests(String identifier, RateLimitConfig config) {
+        if (!circuitBreaker.allowRequest()) {
+            return fallback.getRemainingRequests(identifier, config);
+        }
         try {
             String key = KEY_PREFIX + identifier;
             Object tokensObj = redisTemplate.opsForHash().get(key, "tokens");
+            circuitBreaker.recordSuccess();
             if (tokensObj == null)
                 return config.getMaxRequests();
             return Math.max(0, Long.parseLong(tokensObj.toString()));
         } catch (RedisConnectionFailureException ex) {
-            log.warn("[Redis] Connection failed — using fallback getRemainingRequests for: {}", identifier);
+            circuitBreaker.recordFailure();
             return fallback.getRemainingRequests(identifier, config);
         }
     }
 
     @Override
     public long getResetTimeEpochSeconds(String identifier, RateLimitConfig config) {
-        // Redis keys expire after windowSeconds — reset time ≈ now + windowSeconds
         return System.currentTimeMillis() / 1000 + config.getWindowSeconds();
     }
 
     @Override
     public String getAlgorithmName() {
         return "REDIS_TOKEN_BUCKET";
+    }
+
+    private void recordFallback() {
+        if (metrics != null)
+            metrics.recordFallback();
     }
 }

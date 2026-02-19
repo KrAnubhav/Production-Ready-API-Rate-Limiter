@@ -102,6 +102,14 @@ public class RateLimiterService {
         return getConfigForIdentifier(identifier).getMaxRequests();
     }
 
+    /**
+     * Returns the name of the currently active rate limiting algorithm (e.g.
+     * REDIS_TOKEN_BUCKET).
+     */
+    public String getActiveAlgorithmName() {
+        return activeStrategy.getAlgorithmName();
+    }
+
     public RateLimitConfig getConfigForIdentifier(String identifier) {
         return configRepository.findByIdentifier(identifier)
                 .orElseGet(() -> buildDefaultConfig(identifier));
